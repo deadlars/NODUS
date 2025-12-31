@@ -13,6 +13,58 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// Proxy endpoint для браузера
+app.post('/api/proxy', async (req, res) => {
+  try {
+    const { url, method = 'GET', headers = {} } = req.body;
+    
+    if (!url) {
+      return res.json({ ok: false, error: 'URL required' });
+    }
+
+    console.log(`[Proxy] Fetching ${url}`);
+    
+    // Добавляем заголовки для анонимности
+    const proxyHeaders = {
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1',
+      ...headers
+    };
+
+    const response = await fetch(url, {
+      method,
+      headers: proxyHeaders,
+      timeout: 15000
+    });
+
+    if (!response.ok) {
+      return res.json({ ok: false, error: `HTTP ${response.status}` });
+    }
+
+    const content = await response.text();
+    
+    res.json({
+      ok: true,
+      content,
+      headers: Object.fromEntries(response.headers.entries()),
+      status: response.status
+    });
+
+  } catch (error) {
+    console.error('[Proxy] Error:', error);
+    res.json({ ok: false, error: error.message });
+  }
+});
+
+// Health check для браузера
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, status: 'healthy', timestamp: Date.now() });
+});
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
@@ -471,6 +523,39 @@ app.get('/health', (req, res) => {
     mailboxes: mailboxes.size,
     groups: Object.keys(groups).length,
     uptime: process.uptime()
+  });
+});
+
+// TURN credentials (временные, истекают через 24 часа)
+const TURN_SECRET = process.env.TURN_SECRET || 'nodus-turn-secret-key-2024';
+app.get('/api/turn', (req, res) => {
+  const ttl = 86400; // 24 часа
+  const timestamp = Math.floor(Date.now() / 1000) + ttl;
+  const username = `${timestamp}:nodus`;
+  
+  // HMAC-SHA1 для coturn
+  const crypto = require('crypto');
+  const hmac = crypto.createHmac('sha1', TURN_SECRET);
+  hmac.update(username);
+  const credential = hmac.digest('base64');
+  
+  res.json({
+    ok: true,
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:194.87.103.193:3478' },
+      { 
+        urls: 'turn:194.87.103.193:3478',
+        username,
+        credential
+      },
+      { 
+        urls: 'turn:194.87.103.193:3478?transport=tcp',
+        username,
+        credential
+      }
+    ],
+    ttl
   });
 });
 
