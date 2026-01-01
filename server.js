@@ -24,39 +24,83 @@ app.post('/api/proxy', async (req, res) => {
 
     console.log(`[Proxy] Fetching ${url}`);
     
+    // Блокируем вредоносные домены
+    const blockedDomains = [
+      'malware.com', 'phishing.com', 'spam.com'
+    ];
+    
+    const urlObj = new URL(url);
+    if (blockedDomains.some(domain => urlObj.hostname.includes(domain))) {
+      return res.json({ ok: false, error: 'Blocked domain' });
+    }
+    
     // Добавляем заголовки для анонимности
     const proxyHeaders = {
-      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.5',
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
       'Accept-Encoding': 'gzip, deflate, br',
       'Connection': 'keep-alive',
       'Upgrade-Insecure-Requests': '1',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Cache-Control': 'max-age=0',
       ...headers
     };
+
+    // Удаляем заголовки которые могут выдать прокси
+    delete proxyHeaders['X-Forwarded-For'];
+    delete proxyHeaders['X-Real-IP'];
+    delete proxyHeaders['Via'];
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // Увеличил до 30 сек
 
     const response = await fetch(url, {
       method,
       headers: proxyHeaders,
-      timeout: 15000
+      signal: controller.signal
     });
 
+    clearTimeout(timeoutId);
+
     if (!response.ok) {
-      return res.json({ ok: false, error: `HTTP ${response.status}` });
+      return res.json({ ok: false, error: `HTTP ${response.status} ${response.statusText}` });
     }
 
-    const content = await response.text();
+    let content = await response.text();
+    
+    // Базовая очистка контента от трекеров
+    content = content
+      .replace(/google-analytics\.com\/[^"']*/g, '#blocked')
+      .replace(/googletagmanager\.com\/[^"']*/g, '#blocked')
+      .replace(/facebook\.com\/tr[^"']*/g, '#blocked')
+      .replace(/doubleclick\.net\/[^"']*/g, '#blocked');
     
     res.json({
       ok: true,
       content,
       headers: Object.fromEntries(response.headers.entries()),
-      status: response.status
+      status: response.status,
+      url: response.url,
+      timestamp: Date.now()
     });
 
   } catch (error) {
     console.error('[Proxy] Error:', error);
-    res.json({ ok: false, error: error.message });
+    
+    if (error.name === 'AbortError') {
+      res.json({ ok: false, error: 'Request timeout (30s)' });
+    } else if (error.code === 'UND_ERR_CONNECT_TIMEOUT') {
+      res.json({ ok: false, error: 'Connection timeout - site may be slow or unreachable' });
+    } else if (error.code === 'ENOTFOUND') {
+      res.json({ ok: false, error: 'Domain not found' });
+    } else if (error.code === 'ECONNREFUSED') {
+      res.json({ ok: false, error: 'Connection refused by server' });
+    } else {
+      res.json({ ok: false, error: `Network error: ${error.message}` });
+    }
   }
 });
 
@@ -514,6 +558,157 @@ app.post('/relay', (req, res) => {
   }
 });
 
+// ============ SOCIAL NETWORK API ============
+const socialPosts = {};       // postId -> post
+const socialFollows = {};     // oderId -> Set of following ids
+const socialProfiles = {};    // oderId -> profile
+
+app.post('/social', (req, res) => {
+  const { action } = req.body;
+  
+  switch (action) {
+    case 'createPost': {
+      const { post } = req.body;
+      if (!post?.id || !post?.authorId) return res.json({ ok: false, error: 'Invalid post' });
+      
+      socialPosts[post.id] = { ...post, timestamp: post.timestamp || Date.now() };
+      logMessage(`[Social] Post created: ${post.id.slice(0,8)} by ${post.authorId.slice(0,8)}`);
+      res.json({ ok: true, postId: post.id });
+      break;
+    }
+    
+    case 'toggleLike': {
+      const { postId, oderId } = req.body;
+      const post = socialPosts[postId];
+      if (!post) return res.json({ ok: false, error: 'Post not found' });
+      
+      if (!post.likes) post.likes = [];
+      const idx = post.likes.indexOf(oderId);
+      if (idx >= 0) {
+        post.likes.splice(idx, 1);
+        res.json({ ok: true, liked: false });
+      } else {
+        post.likes.push(oderId);
+        res.json({ ok: true, liked: true });
+      }
+      break;
+    }
+    
+    case 'addComment': {
+      const { postId, comment } = req.body;
+      const post = socialPosts[postId];
+      if (!post || !comment) return res.json({ ok: false });
+      
+      if (!post.comments) post.comments = [];
+      post.comments.push(comment);
+      res.json({ ok: true, commentId: comment.id });
+      break;
+    }
+    
+    case 'repost': {
+      const { repost, originalPostId } = req.body;
+      if (!repost?.id) return res.json({ ok: false });
+      
+      socialPosts[repost.id] = repost;
+      const original = socialPosts[originalPostId];
+      if (original) {
+        if (!original.reposts) original.reposts = [];
+        original.reposts.push(repost.authorId);
+      }
+      res.json({ ok: true, postId: repost.id });
+      break;
+    }
+    
+    case 'toggleFollow': {
+      const { followerId, followingId } = req.body;
+      if (!followerId || !followingId) return res.json({ ok: false });
+      
+      if (!socialFollows[followerId]) socialFollows[followerId] = new Set();
+      const set = socialFollows[followerId];
+      
+      if (set.has(followingId)) {
+        set.delete(followingId);
+        res.json({ ok: true, following: false });
+      } else {
+        set.add(followingId);
+        res.json({ ok: true, following: true });
+      }
+      break;
+    }
+    
+    case 'getFeed': {
+      const { oderId, offset = 0, limit = 20 } = req.body;
+      const following = socialFollows[oderId] || new Set();
+      
+      const posts = Object.values(socialPosts)
+        .filter(p => p.authorId === oderId || following.has(p.authorId))
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(offset, offset + limit);
+      
+      res.json({ ok: true, posts });
+      break;
+    }
+    
+    case 'getExplore': {
+      const { offset = 0, limit = 20 } = req.body;
+      
+      const posts = Object.values(socialPosts)
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(offset, offset + limit);
+      
+      res.json({ ok: true, posts });
+      break;
+    }
+    
+    case 'getProfile': {
+      const { oderId } = req.body;
+      const profile = socialProfiles[oderId] || profiles[oderId];
+      if (profile) {
+        const userPosts = Object.values(socialPosts).filter(p => p.authorId === oderId);
+        const followersCount = Object.values(socialFollows).filter(s => s.has(oderId)).length;
+        const followingCount = socialFollows[oderId]?.size || 0;
+        
+        res.json({ 
+          ok: true, 
+          profile: { 
+            ...profile, 
+            postsCount: userPosts.length,
+            followersCount,
+            followingCount
+          } 
+        });
+      } else {
+        res.json({ ok: false, error: 'Profile not found' });
+      }
+      break;
+    }
+    
+    case 'updateProfile': {
+      const { profile } = req.body;
+      if (!profile?.oderId) return res.json({ ok: false });
+      
+      socialProfiles[profile.oderId] = { ...socialProfiles[profile.oderId], ...profile };
+      res.json({ ok: true });
+      break;
+    }
+    
+    case 'deletePost': {
+      const { postId, authorId } = req.body;
+      const post = socialPosts[postId];
+      if (post && post.authorId === authorId) {
+        delete socialPosts[postId];
+        res.json({ ok: true });
+      } else {
+        res.json({ ok: false, error: 'Not authorized' });
+      }
+      break;
+    }
+    
+    default:
+      res.json({ ok: false, error: 'Unknown action' });
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({
@@ -522,6 +717,7 @@ app.get('/health', (req, res) => {
     profiles: Object.keys(profiles).length,
     mailboxes: mailboxes.size,
     groups: Object.keys(groups).length,
+    socialPosts: Object.keys(socialPosts).length,
     uptime: process.uptime()
   });
 });
